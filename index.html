@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>ISP Network Map - Phase 2 Full</title>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+  <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js"></script>
+
+  <style>
+    body { margin: 0; font-family: sans-serif; }
+    #map { height: 100vh; }
+
+    /* Controls */
+    #controls {
+      position: absolute;
+      top: 10px; left: 10px;
+      background: white; padding: 10px; border-radius: 6px;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.3); z-index: 1000;
+      max-width: 200px;
+    }
+
+    /* Modal */
+    #deviceModal {
+      display: none;
+      position: fixed; z-index: 2000;
+      left: 0; top: 0; width: 100%; height: 100%;
+      background: rgba(0,0,0,0.5);
+      justify-content: center; align-items: center;
+    }
+    #deviceModalContent {
+      background: white; padding: 15px; border-radius: 6px; width: 300px;
+    }
+    #deviceModal input, #deviceModal select { width: 100%; margin: 5px 0; padding: 5px; }
+    #deviceModal button { margin-top: 10px; width: 100%; padding: 7px; }
+
+    #searchBox { width: 100%; margin-bottom: 5px; padding: 5px; }
+  </style>
+</head>
+<body>
+
+<div id="controls">
+  <input type="text" id="searchBox" placeholder="Search devices by name...">
+  <b>Filter Devices</b><br>
+  <label><input type="checkbox" class="device-filter" value="router" checked> Router</label><br>
+  <label><input type="checkbox" class="device-filter" value="pppoe" checked> PPPoE</label><br>
+  <label><input type="checkbox" class="device-filter" value="receiver" checked> Receiver</label><br>
+  <label><input type="checkbox" class="device-filter" value="switch" checked> Switch</label><br>
+  <hr>
+  <b>Legend:</b><br>
+  🔵 Router<br>
+  🟣 PPPoE<br>
+  🟠 Receiver<br>
+  ⚫ Switch<br>
+  🟢 Online<br>
+  🔴 Offline<br>
+  🟡 Suspended<br>
+  Light Blue → Drop Cable<br>
+  Black → ADS Backbone
+</div>
+
+<!-- Device Modal -->
+<div id="deviceModal">
+  <div id="deviceModalContent">
+    <h3 id="modalTitle">Add Device</h3>
+    <input type="text" id="deviceName" placeholder="Device Name" required>
+    <select id="deviceType">
+      <option value="router">Router</option>
+      <option value="pppoe">PPPoE</option>
+      <option value="receiver">Receiver</option>
+      <option value="switch">Switch</option>
+    </select>
+    <select id="deviceStatus">
+      <option value="planned">Planned</option>
+      <option value="online">Online</option>
+      <option value="offline">Offline</option>
+      <option value="suspended">Suspended</option>
+    </select>
+    <input type="text" id="devicePPPoE" placeholder="PPPoE Username (optional)">
+    <button id="saveDeviceBtn">Save</button>
+    <button id="cancelDeviceBtn">Cancel</button>
+  </div>
+</div>
+
+<div id="map"></div>
+
+<script>
+const supabaseUrl = "https://ufvilvzfocjaqrzegafn.supabase.co";
+const supabaseKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVmdmlsdnpmb2NqYXFyemVnYWZuIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzEwMjgyMTYsImV4cCI6MjA4NjYwNDIxNn0.6rpYlIRyMt9fzK7YLca2QZgqDzeUBIYkS6QUb7rLINY";
+const { createClient } = supabase;
+const client = createClient(supabaseUrl, supabaseKey);
+
+const map = L.map('map').setView([-1.286389, 36.817223], 13);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  attribution: '&copy; OpenStreetMap contributors'
+}).addTo(map);
+
+const deviceColors = {
+  router: "blue",
+  pppoe: "purple",
+  receiver: "orange",
+  switch: "darkgray"
+};
+const statusColors = { online:"green", offline:"red", suspended:"yellow", planned:null };
+
+let markers = [];
+let connections = [];
+let selectedDevice = null;
+let modalDevice = { lat: null, lng: null, id: null };
+
+// Modal elements
+const modal = document.getElementById('deviceModal');
+const modalTitle = document.getElementById('modalTitle');
+const nameInput = document.getElementById('deviceName');
+const typeInput = document.getElementById('deviceType');
+const statusInput = document.getElementById('deviceStatus');
+const pppoeInput = document.getElementById('devicePPPoE');
+const saveBtn = document.getElementById('saveDeviceBtn');
+const cancelBtn = document.getElementById('cancelDeviceBtn');
+const searchBox = document.getElementById('searchBox');
+
+cancelBtn.onclick = () => modal.style.display = 'none';
+
+// Load devices and connections
+async function loadDevices() {
+  const { data: devices, error: deviceError } = await client.from('devices').select('*');
+  const { data: conns } = await client.from('connections').select('*');
+  if (deviceError) { console.error(deviceError); return; }
+
+const STATUS_POLL_INTERVAL = 5000; // 5 seconds
+
+async function updateDeviceStatuses() {
+  try {
+    const { data: statuses } = await client.from('devices').select('id,status');
+    statuses.forEach(s => {
+      const marker = markers.find(m => m.device.id === s.id);
+      if(marker){
+        marker.device.status = s.status;
+        const baseColor = deviceColors[marker.device.type];
+        const statusColor = statusColors[s.status];
+        marker.setStyle({ color: statusColor || baseColor, fillColor: statusColor || baseColor });
+        marker.setPopupContent(`
+          <b>${marker.device.name}</b><br>
+          Type: ${marker.device.type}<br>
+          PPPoE: ${marker.device.pppoe_username || "-"}<br>
+          Status: ${marker.device.status}
+        `);
+      }
+    });
+  } catch(e) {
+    console.error("Status update error:", e);
+  }
+}
+
+// Start polling
+setInterval(updateDeviceStatuses, STATUS_POLL_INTERVAL);
+
+
+  // clear previous
+  markers.forEach(m => map.removeLayer(m));
+  connections.forEach(l => map.removeLayer(l));
+  markers = []; connections = [];
+
+  // markers
+  devices.forEach(d => {
+    const baseColor = deviceColors[d.type] || "blue";
+    const statusColor = statusColors[d.status] || null;
+    const color = statusColor || baseColor;
+
+    const marker = L.circleMarker([d.latitude, d.longitude], {
+      radius: 8, color, fillColor: color, fillOpacity: 0.8
+    }).addTo(map);
+
+    marker.device = d;
+    marker.bindPopup(`<b>${d.name}</b><br>Type: ${d.type}<br>PPPoE: ${d.pppoe_username || "-"}<br>Status: ${d.status}`);
+
+    marker.on('click', () => handleDeviceClick(marker));
+    markers.push(marker);
+  });
+
+  // persistent connections
+  conns.forEach(c => {
+    const from = devices.find(d => d.id===c.from_device);
+    const to = devices.find(d => d.id===c.to_device);
+    if (from && to) {
+      const line = L.polyline([[from.latitude,from.longitude],[to.latitude,to.longitude]], { color:c.color||"lightblue", weight:3 });
+      line.connectionId = c.id;
+      line.addTo(map);
+      line.on('click', () => deleteConnection(line));
+      connections.push(line);
+    }
+  });
+
+  applyFilter();
+}
+
+// Filter by type & search
+function applyFilter() {
+  const checked = Array.from(document.querySelectorAll('.device-filter:checked')).map(cb=>cb.value);
+  const query = searchBox.value.toLowerCase();
+  markers.forEach(m => {
+    const show = checked.includes(m.device.type) && m.device.name.toLowerCase().includes(query);
+    if (show) map.addLayer(m); else map.removeLayer(m);
+  });
+}
+
+document.querySelectorAll('.device-filter').forEach(cb=>cb.addEventListener('change', applyFilter));
+searchBox.addEventListener('input', applyFilter);
+
+// Map click → add device modal
+map.on('click', e => { modalDevice.lat=e.latlng.lat; modalDevice.lng=e.latlng.lng; modalDevice.id=null; openDeviceModal(); });
+
+function openDeviceModal(device=null){
+  modal.style.display='flex';
+  if(device){
+    modalTitle.textContent='Edit Device';
+    nameInput.value=device.name;
+    typeInput.value=device.type;
+    statusInput.value=device.status;
+    pppoeInput.value=device.pppoe_username||'';
+    modalDevice.id=device.id;
+    modalDevice.lat=device.latitude;
+    modalDevice.lng=device.longitude;
+  } else {
+    modalTitle.textContent='Add Device';
+    nameInput.value='';
+    typeInput.value='router';
+    statusInput.value='planned';
+    pppoeInput.value='';
+  }
+}
+
+saveBtn.onclick = async ()=>{
+  const deviceData = {
+    name:nameInput.value,
+    type:typeInput.value,
+    status:statusInput.value,
+    latitude:modalDevice.lat,
+    longitude:modalDevice.lng,
+    pppoe_username:pppoeInput.value||null
+  };
+  if(modalDevice.id){
+    await client.from('devices').update(deviceData).eq('id',modalDevice.id);
+  } else {
+    await client.from('devices').insert([deviceData]);
+  }
+  modal.style.display='none';
+  loadDevices();
+};
+
+// Device click → connect or edit
+function handleDeviceClick(marker){
+  if(!selectedDevice){
+    selectedDevice=marker;
+    marker.setStyle({ radius:12, weight:3 });
+  } else if(selectedDevice===marker){
+    openDeviceModal(marker.device);
+    marker.setStyle({ radius:8, weight:1 });
+    selectedDevice=null;
+  } else {
+    // create connection
+    const line = L.polyline([[selectedDevice.device.latitude,selectedDevice.device.longitude],[marker.device.latitude,marker.device.longitude]],{color:'lightblue',weight:3});
+    line.addTo(map);
+    connections.push(line);
+    client.from('connections').insert([{ from_device:selectedDevice.device.id, to_device:marker.device.id, type:'drop', color:'lightblue' }]);
+    line.on('click',()=>deleteConnection(line));
+    selectedDevice.setStyle({ radius:8, weight:1 });
+    selectedDevice=null;
+  }
+}
+
+// Delete connection
+async function deleteConnection(line){
+  if(confirm('Delete this connection?')){
+    if(line.connectionId){
+      await client.from('connections').delete().eq('id',line.connectionId);
+    }
+    map.removeLayer(line);
+    connections=connections.filter(l=>l!==line);
+  }
+}
+
+// Simulate automatic status updates every 10s (replace with real API)
+setInterval(async ()=>{
+  markers.forEach(m=>{
+    // randomly toggle online/offline for simulation
+    const statuses=['online','offline','suspended'];
+    const newStatus=statuses[Math.floor(Math.random()*statuses.length)];
+    m.device.status=newStatus;
+    const baseColor=deviceColors[m.device.type];
+    m.setStyle({ color:statusColors[newStatus]||baseColor, fillColor:statusColors[newStatus]||baseColor });
+  });
+},10000);
+
+loadDevices();
+</script>
+
+</body>
+</html>
